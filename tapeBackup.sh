@@ -236,13 +236,31 @@ yay_nay()
 disp_help()
     { # Print script help to screen, and exit.
       # Optional argument will set exit value.
-        echo -e "This is help."
-        echo -e "usage: $0 {COMMAND} {OPTION} {ARGUMENTS}"
-        echo -e "Commands:"
-        echo -e "\tex\t- Example command"
-        echo -e "Options:"
-        echo -e "\t--opt_one|-o\t- Example option"
-        echo -e "Argument\t- File name"
+        echo "Usage:"
+        echo "  $0 [OPTIONS]"
+        echo ""
+        echo "Incremental tape backup from an NFS-mounted source."
+        echo ""
+        echo "Options:"
+        echo "  -h                    Show this help message"
+        echo "  -v <level>            Set debug level explicitly (0-4)"
+        echo "      0 = Silent (no output)"
+        echo "      1 = ERROR only (stderr)"
+        echo "      2 = ERROR + WARNING"
+        echo "      3 = ERROR + WARNING + INFO (default)"
+        echo "      4 = All levels including DEBUG"
+        echo "  -v, -vv, -vvv, -vvvv  Set debug level by verbosity count (1-4)"
+        echo "  --verbose [level]     Long-form debug level flag"
+        echo "  --verbose=<level>     Long-form debug level with value"
+        echo ""
+        echo "Configuration:"
+        echo "  Set variables in .env for: TAPE_DEVICE, NFS_SOURCE, MOUNT_POINT,"
+        echo "  BACKUP_DB_DIR, LOCK_TIMEOUT, ENABLE_LOCKING, ENABLE_ROOT_CHECK."
+        echo ""
+        echo "Examples:"
+        echo "  sudo $0                       Run with default configuration"
+        echo "  $0 -vvv                      Verbose error output"
+        echo "  $0 -v 4                      Maximum debug logging"
         if [ $# = 1 ]
             then
                 if [[ "$1" =~ '^[0-9]+$' ]]
