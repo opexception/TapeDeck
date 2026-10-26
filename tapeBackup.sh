@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -uo pipefail
+
 ###############################################################################
 ## Load environment variables from .env file
 ###############################################################################
@@ -276,36 +278,27 @@ disp_help()
 acquire_lock() {
     debugit INFO "Attempting to acquire lock..."
 
-    timeout_count=0
-    max_timeout="${LOCK_TIMEOUT:-60}"
-
-    exec {LOCK_FD}>"${LOCK_FILE}" || {
+    local fd
+    exec {fd}>"${LOCK_FILE}" || {
         debugit ERROR "Failed to open lock file for writing"
         return 1
     }
 
-    while ! flock -n "$LOCK_FD" echo $$ 2>/dev/null; do
-        if [[ $timeout_count -ge $max_timeout ]]; then
-            debugit ERROR "Lock acquisition timed out after ${max_timeout} seconds"
-            exec {LOCK_FD}>&-
-            return 1
-        fi
-
+    if ! flock -n "${fd}"; then
+        local existing_pid
         existing_pid=$(head -n1 "${LOCK_FILE}" 2>/dev/null | awk '{print $2}')
         if [[ -n "$existing_pid" ]]; then
-            debugit INFO "Waiting for PID ${existing_pid} to release lock (timeout: $((max_timeout - timeout_count))s)..."
+            debugit INFO "Lock already held by PID ${existing_pid}"
         fi
+        exec {fd}>&-
+        return 1
+    fi
 
-        sleep 1
-        ((timeout_count++))
-    done
-
-    {
-        echo "$USER $$ $(date +%Y%m%d%H%M%S)"
-    } >&$LOCK_FD || {
+    echo "$USER $$ $(date +%Y%m%d%H%M%S)" >&${fd} || {
         debugit WARNING "Could not write lock metadata"
     }
 
+    LOCK_FD="${fd}"
     GOT_LOCK="true"
     return 0
 }
@@ -480,6 +473,16 @@ if ! mount "$SRC" "$DIR"; then
     debugit ERROR "Failed to mount ${SRC} on ${DIR}"
     exit 1
 fi
+
+# Validate the mount is actually usable (mount(1) can succeed even if the
+# filesystem is stale or unreachable)
+if [[ ! -d "${DIR}" || ! $(mountpoint -q "${DIR}" 2>/dev/null || true) ]]; then
+    debugit ERROR "NFS mount at ${DIR} is not accessible"
+    exit 1
+fi
+
+debugit INFO "NFS share ${SRC} mounted successfully on ${DIR}"
+
 MOUNTED_NFS=true
 
 mkdir -p "$BACKUP_DB_DIR" || {
