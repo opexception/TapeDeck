@@ -1,5 +1,29 @@
 # restore.sh Requires These Changes to tapeBackup.sh First
 
+## Implementation status
+
+The backup prerequisites below are implemented in `tapeBackup.sh` and
+`tape_metadata.py`. See [README.md](README.md) for configuration, archive layout,
+metadata schema, snapshot migration, and verification commands.
+
+- [x] Manifest and file inventory first in the archive, with permanent disk and
+  best-effort NFS copies after completion.
+- [x] Configurable out-of-band `METADATA_FILE` JSONL catalog and per-run indexes.
+- [x] Preserved pre/post `.tardb` history, transactional working snapshots, and
+  explicit parent/full-chain backup IDs and ordered tape dependencies.
+- [x] `--list-archive` / `-L`, without mounting NFS or updating backup state.
+- [x] GNU tar native run/volume labels on every tape, plus `.manifests_included`.
+
+The original examples below are design sketches, not executable recipes. In
+particular, moving the live snapshot before tar resets incremental state, and
+reopening an auto-rewind tape to write a separate label/archive can overwrite
+the backup. The implementation copies snapshot state and writes a single
+manifest-first multi-volume archive. Continuation tapes carry run/volume labels;
+the first tape carries the JSON index. Final elapsed time and volume counts are
+available in completed disk manifests/catalog entries, since those values are
+unknown when the on-tape manifest is written. The interactive restore script
+below remains a sketch for future work.
+
 ## Goal
 `restore.sh` will be an interactive script that:
 1. Lists available backups by scanning all tapes for label/index metadata → lets user pick a backup number/date to restore from

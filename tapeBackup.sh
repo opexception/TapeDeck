@@ -2,592 +2,233 @@
 
 set -uo pipefail
 
-###############################################################################
-## Load environment variables from .env file
-###############################################################################
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "${SCRIPT_DIR}/.env" ]; then
-    while IFS='=' read -r key value; do
-        [[ -z "$key" || "$key" =~ ^# ]] && continue
-        key="${key%%[[:space:]]}"
-        key="${key##[[:space:]]}"
-        value="${value#\~}"
-        value="${value#[\"\']}"
-        value="${value%[\"\']}"
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ -z "$key" ]] && continue
+        [[ "$key" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || {
+            printf 'Invalid configuration key: %s\n' "$key" >&2
+            exit 1
+        }
+        value="${value%$'\r'}"
+        if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
         export "$key=$value"
     done < "${SCRIPT_DIR}/.env"
 fi
 
-###############################################################################
-## Initialize some variables
-###############################################################################
-HOSTNAME=$(uname -n)
+DEBUG_LEVEL="${DEBUG_LEVEL:-3}"
+TAPE_DEVICE="${TAPE_DEVICE:-/dev/st0}"
+NFS_SOURCE="${NFS_SOURCE:-10.0.4.25:/xfer}"
+MOUNT_POINT="${MOUNT_POINT:-/nas/qnap}"
+BACKUP_DB_DIR="${BACKUP_DB_DIR:-/root/backup_db}"
+METADATA_FILE="${METADATA_FILE:-/global/tapeback-metadata/backups.jsonl}"
+LOCK_FILE="${LOCK_FILE:-/tmp/tapeBackup.lock}"
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-60}"
+ENABLE_LOCKING="${ENABLE_LOCKING:-false}"
+ENABLE_ROOT_CHECK="${ENABLE_ROOT_CHECK:-false}"
+TAR_COMMAND="${TAR_COMMAND:-tar}"
+MODE=backup
+FULL_BACKUP=false
 
-
-# Remove the first ".", and everything after it from $HOSTNAME
-SHORT_NAME=${HOSTNAME%%.*} 
-
-  # Remove the first ".", and everything before it from $HOSTNAME
-FULL_DOMAIN=${HOSTNAME#*.}
-
-# Remove the first ".", and everything after it from $FULL_DOMAIN
-DOMAIN=${FULL_DOMAIN%%.*} 
-
-# Full path to the script that we'll use to retrieve YAML variables.
-YAML_SCRIPT="${YAML_SCRIPT:-/global/bin/yaml/yaml.py}"
-
-# Get this processes PID
-MYPID=$$
-
-# Record start time (epoch) for elapsed duration calculation
-START_EPOCH=$(date +%s)
-
-# Get a timestamp
-tstamp=$(date +%Y%m%d%H%M%S)
-
-# Logfile path (captured before environment is modified by NFS mount)
-LOG_DIR="${SCRIPT_DIR}/logs"
-mkdir -p "${LOG_DIR}" 2>/dev/null || true
-LOG_FILE="${LOG_DIR}/tape_backup_$(date +%Y%m%d_%H%M%S).log"
-
-# Get the base directory of this script
-SOURCE_DIR="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE_DIR" ]; do # resolve $SOURCE_DIR until the file is no longer a symlink
-  BIN_DIR="$( cd -P "$( dirname "$SOURCE_DIR" )" >/dev/null 2>&1 && pwd )"
-  SOURCE_DIR="$(readlink "$SOURCE_DIR")"
-  [[ $SOURCE_DIR != /* ]] && SOURCE_DIR="$BIN_DIR/$SOURCE_DIR" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
-done
-BIN_DIR="$( cd -P "$( dirname "$SOURCE_DIR" )" >/dev/null 2>&1 && pwd )"
-
-
-# NFS mount cleanup flag
-MOUNTED_NFS=false
-
-# Lock file in the /tmp directory
-LOCK_FILE="/tmp/${0}.lck"
-LOCK_FD=""
-
-###############################################################################
-## LOGGING — writes every message to logfile (with timestamps) and stdout/stderr
-###############################################################################
-
-write_log_header() {
-    # Write full system metadata to logfile — every line has a per-line timestamp
-    logger INFO "=== TAPE BACKUP RUN — $(date '+%Y-%m-%d %H:%M:%S') ==="
-    logger DEBUG ""
-    logger DEBUG "### System Information ###"
-    logger DEBUG "Hostname:      $(hostname)"
-    logger DEBUG "OS:            $(uname -s) $(uname -r)"
-    logger DEBUG "User:          $(whoami)"
-    logger DEBUG "Kernel:        $(uname -v)"
-    logger DEBUG "Architecture:  $(uname -m)"
-    logger DEBUG "Uptime:        $(uptime)"
-    logger DEBUG ""
-    logger DEBUG "### Source Details ###"
-    logger DEBUG "NFS source:    ${NFS_SOURCE}"
-    logger DEBUG "  -> server =  $(echo "${NFS_SOURCE}" | cut -d: -f1)"
-    logger DEBUG "  -> export   = $(echo "${NFS_SOURCE}" | cut -d: -f2)"
-    logger DEBUG "Mount point:   ${MOUNT_POINT}"
-    logger DEBUG "Tape device:   ${TAPE_DEVICE}"
-    logger DEBUG "Backup DB dir: ${BACKUP_DB_DIR}"
-    logger DEBUG ""
-    logger DEBUG "### Disk Usage ###"
-    df -h / 2>/dev/null | while IFS= read -r line; do logger DEBUG "  $line"; done
-
-    logger INFO "Logging to logfile: ${LOG_FILE}"
+disp_help() {
+    printf 'Usage: %s [OPTIONS]\n' "$0"
+    printf '%s\n' \
+        'Incremental tape backup from an NFS-mounted source.' \
+        '' \
+        '  -h, --help             Show help' \
+        '  -L, --list-archive     List the loaded archive without mounting NFS' \
+        '  --full                Start a new full backup chain' \
+        '  -v, -vv, -vvv, -vvvv  Set verbosity by count (1-4)' \
+        '  -v N, -V N            Set verbosity explicitly (0-4)' \
+        '  --verbose[=N]         Set verbosity (default: 4)' \
+        '' \
+        'Configuration is loaded from .env beside this script.' \
+        'Metadata: METADATA_FILE (JSONL catalog), BACKUP_DB_DIR (snapshots).' \
+        'Multi-volume backups/listings prompt for subsequent tapes via GNU tar.'
 }
+
+while (( $# )); do
+    case "$1" in
+        -h|--help) disp_help; exit 0 ;;
+        -L|--list-archive) MODE=list ;;
+        --full) FULL_BACKUP=true ;;
+        -v|--verbose)
+            if [[ "${2:-}" =~ ^[0-4]$ ]]; then
+                DEBUG_LEVEL="$2"
+                shift
+            elif [[ "$1" == -v ]]; then
+                DEBUG_LEVEL=1
+            else
+                DEBUG_LEVEL=4
+            fi
+            ;;
+        -vv) DEBUG_LEVEL=2 ;;
+        -vvv) DEBUG_LEVEL=3 ;;
+        -vvvv) DEBUG_LEVEL=4 ;;
+        -V)
+            [[ $# -ge 2 ]] || { printf '%s\n' '-V requires a level' >&2; exit 2; }
+            DEBUG_LEVEL="$2"
+            shift
+            ;;
+        --verbose=*) DEBUG_LEVEL="${1#*=}" ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; disp_help >&2; exit 2 ;;
+    esac
+    shift
+done
+[[ "$DEBUG_LEVEL" =~ ^[0-4]$ && "$LOCK_TIMEOUT" =~ ^[0-9]+$ ]] || {
+    printf '%s\n' 'DEBUG_LEVEL must be 0-4; LOCK_TIMEOUT must be a nonnegative integer' >&2
+    exit 2
+}
+
+START_EPOCH=$(date +%s)
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "$LOG_DIR" || exit 1
+LOG_FILE="${LOG_DIR}/tape_backup_$(date -u +%Y%m%d_%H%M%S)_$$.log"
+MOUNTED_NFS=false
+WORK_DIR=""
 
 logger() {
-    local level="$1"; shift
-    local msg="$*"
-    local ts
-    ts=$(date "+%Y-%m-%d %H:%M:%S")
-    local line="[${ts}] [${level}] ${msg}"
-
-    # Always write to logfile with timestamp
-    echo "${line}" >> "${LOG_FILE}" 2>/dev/null || true
-
-    # Follow existing debugit conventions for terminal output
-    case "${level}" in
-        ERROR)   >&2 echo -e "${line}" ;;
-        WARNING)       echo -e "${line}" ;;
-        INFO|DEBUG)    echo -e "${line}" ;;
-        *)     >&2 echo -e "[${ts}] [${level}] ${msg}" ;;
+    local level="$1" threshold line
+    shift
+    case "$level" in
+        ERROR) threshold=1 ;;
+        WARNING) threshold=2 ;;
+        INFO) threshold=3 ;;
+        *) threshold=4 ;;
     esac
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
+    printf '%s\n' "$line" >> "$LOG_FILE"
+    if (( DEBUG_LEVEL >= threshold )); then
+        if [[ "$level" == ERROR || "$MODE" == list ]]; then
+            printf '%s\n' "$line" >&2
+        else
+            printf '%s\n' "$line"
+        fi
+    fi
 }
-
-###############################################################################
-## SCRIPT STARTS HERE  
 
 cleanup() {
-    exit_code=$?
-    if [[ "$MOUNTED_NFS" == "true" && -n "${DIR:-}" ]]; then
-        logger DEBUG "Cleaning up: unmounting ${DIR}..."
-        umount "${DIR}" 2>/dev/null || true
+    local exit_code=$?
+    trap - EXIT
+    if [[ "$MOUNTED_NFS" == true ]]; then
+        umount "$MOUNT_POINT" || logger WARNING "Could not unmount ${MOUNT_POINT}"
     fi
-    if [[ -n "${LOCK_FD:-}" ]]; then
-        exec {LOCK_FD}>&-
-    fi
-    rm -f "${LOCK_FILE}" 2>/dev/null || true
-    exit $exit_code
+    [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+    # flock descriptors are closed by exit. Never unlink a lock still in use.
+    exit "$exit_code"
 }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-trap cleanup EXIT INT TERM HUP
+fail() { logger ERROR "$*"; exit 1; }
 
-###############################################################################
-## SETUP DEBUGGING/LOGGING
-###############################################################################
-# use the "-x" argument to set debugging.
-# Initial debug level. Will be overwritten by "-x" argument, once it has been parsed.
-debug_level="${DEBUG_LEVEL:-3}"
-
-debugit()
-    { # Output debug messages depending on how $debug_level is set.
-      # first argument is the type of message. Must be one of the following:
-      #    ERROR
-      #    WARNING
-      #    INFO
-      #    DEBUG
-      # Example: 
-      #   debugit INFO "This is how you use the debug feature."
-      # Example output:
-      #   INFO: This is how you use the debug feature.
-
-    case ${debug_level} in
-        0)
-            return 0
-        ;;
-        1)
-            case ${1} in
-                ERROR)
-                    shift
-                    >&2 echo -e "ERROR: $@"
-                    return 0
-                ;;
-                WARNING)
-                    return 0
-                ;;
-                INFO)
-                    return 0
-                ;;
-                DEBUG)
-                    return 0
-                ;;
-                *)
-                    >&2 echo -e "INTERNAL ERROR - Debug message type '$1' is invalid."
-                    return 1
-                ;;
-            esac
-        ;;
-        2)
-            case ${1} in
-                ERROR)
-                    shift
-                    >&2 echo -e "ERROR: $@"
-                    return 0
-                ;;
-                WARNING)
-                    shift
-                    echo -e "WARNING: $@"
-                    return 0
-                ;;
-                INFO)
-                    return 0
-                ;;
-                DEBUG)
-                    return 0
-                ;;
-                *)
-                    >&2 echo -e "INTERNAL ERROR - Debug message type '$1' is invalid."
-                    return 1
-                ;;
-            esac
-        ;;
-        3)
-            case ${1} in
-                ERROR)
-                    shift
-                    >&2 echo -e "ERROR: $@"
-                    return 0
-                ;;
-                WARNING)
-                    shift
-                    echo -e "WARNING: $@"
-                    return 0
-                ;;
-                INFO)
-                    shift
-                    echo -e "INFO: $@"
-                    return 0
-                ;;
-                DEBUG)
-                    return 0
-                ;;
-                *)
-                    >&2 echo "INTERNAL ERROR - Debug message type '$1' is invalid."
-                    return 1
-                ;;
-            esac
-        ;;
-        4)
-            case ${1} in
-                ERROR)
-                    shift
-                    >&2 echo -e "ERROR: $@"
-                    return 0
-                ;;
-                WARNING)
-                    shift
-                    echo -e "WARNING: $@"
-                    return 0
-                ;;
-                INFO)
-                    shift
-                    echo -e "INFO: $@"
-                    return 0
-                ;;
-                DEBUG)
-                    shift
-                    echo -e "DEBUG: $@"
-                    return 0
-                ;;
-                *)
-                    >&2 echo "INTERNAL ERROR - Debug message type '$1' is invalid."
-                    return 1
-                ;;
-            esac
-        ;;
-        *)
-            echo "INTERNAL ERROR - Invalid debug level '${debug_level}'"
-            echo "Setting debug level to default of 3"
-            debug_level=3
-        ;;
-    esac
-    }
-
-
-yay_nay()
-    { # A yes/no prompt
-        if (( $# > 0 ))
-            then
-                MSG="$@"
-            else
-                MSG="Would you like to continue?"
-        fi
-        read -p "${MSG} [y/N]: " yaynay
-        yaynay=$(echo ${yaynay:0:1} | tr "[a-z]" "[A-Z]")
-        case ${yaynay} in
-            Y)
-                return 0
-            ;;
-            N)
-                return 1
-            ;;
-            "")
-                return 1 # Default to No
-                #return 0 # Default to Yes
-            ;;
-            *)
-                yay_nay $@
-                return $?
-            ;;
-        esac
-    }
-
-
-disp_help()
-    { # Print script help to screen, and exit.
-      # Optional argument will set exit value.
-        echo "Usage:"
-        echo "  $0 [OPTIONS]"
-        echo ""
-        echo "Incremental tape backup from an NFS-mounted source."
-        echo ""
-        echo "Options:"
-        echo "  -h                    Show this help message"
-        echo "  -v <level>            Set debug level explicitly (0-4)"
-        echo "      0 = Silent (no output)"
-        echo "      1 = ERROR only (stderr)"
-        echo "      2 = ERROR + WARNING"
-        echo "      3 = ERROR + WARNING + INFO (default)"
-        echo "      4 = All levels including DEBUG"
-        echo "  -v, -vv, -vvv, -vvvv  Set debug level by verbosity count (1-4)"
-        echo "  --verbose [level]     Long-form debug level flag"
-        echo "  --verbose=<level>     Long-form debug level with value"
-        echo ""
-        echo "Configuration:"
-        echo "  Set variables in .env for: TAPE_DEVICE, NFS_SOURCE, MOUNT_POINT,"
-        echo "  BACKUP_DB_DIR, LOCK_TIMEOUT, ENABLE_LOCKING, ENABLE_ROOT_CHECK."
-        echo ""
-        echo "Examples:"
-        echo "  sudo $0                       Run with default configuration"
-        echo "  $0 -vvv                      Verbose error output"
-        echo "  $0 -v 4                      Maximum debug logging"
-        if [ $# = 1 ]
-            then
-                if [[ "$1" =~ '^[0-9]+$' ]]
-                    then exit $1
-                    else exit 2
-                fi
-            else
-                exit
-        fi
-    }
-
-
-acquire_lock() {
-    logger DEBUG "Attempting to acquire lock..."
-
-    local fd
-    exec {fd}>"${LOCK_FILE}" || {
-        logger ERROR "Failed to open lock file for writing"
-        return 1
-    }
-
-    if ! flock -n "${fd}"; then
-        local existing_pid
-        existing_pid=$(head -n1 "${LOCK_FILE}" 2>/dev/null | awk '{print $2}')
-        if [[ -n "$existing_pid" ]]; then
-            logger DEBUG "Lock already held by PID ${existing_pid}"
-        fi
-        exec {fd}>&-
-        return 1
-    fi
-
-    echo "$USER $$ $(date +%Y%m%d%H%M%S)" >&${fd} || {
-        logger WARNING "Could not write lock metadata"
-    }
-
-    LOCK_FD="${fd}"
-    GOT_LOCK="true"
-    return 0
-}
-
-
-# Make sure user has Root privileges before allowing to continue.
-
-Check_Root() {
-    logger DEBUG "Checking user permissions..."
-    if (( $(id -u) != 0 )); then
-        logger ERROR "Sorry! Only root can do that"
-        exit 1
-    fi
-    logger DEBUG " OK"
-}
-
-if [ "${ENABLE_ROOT_CHECK:-true}" == "true" ]; then
-    Check_Root
-fi
-
-if [ "${ENABLE_LOCKING:-true}" == "true" ]; then
-    if ! acquire_lock; then
-        exit 1
-    fi
-fi
-
-# Write log header with system/source metadata (captured at startup)
-write_log_header
-
-# Commands
-if [ $# -ge 1 ]
-    then
-        logger DEBUG "Parsing command"
-        if [ ${1#-} = $1 ]
-            then
-                commandArg="$1"
-                shift
-                logger DEBUG "Command specified is: ${commandArg}"
-
-                case ${commandArg} in
-                    yyyy)
-                        logger DEBUG "Recognized command: ${commandArg}"
-                    ;;
-                    *)
-                        logger WARNING "Unknown command: ${commandArg}"
-                        echo "${0}: Unknown command: ${commandArg}" >&2
-                        disp_help 1
-                esac
-            else
-                commandArg="NULL"
-        fi
+wait_for_lock() {
+    if [[ "$LOCK_TIMEOUT" == 0 ]]; then
+        flock -n "$1"
     else
-        logger INFO "No command specified (normal execution)"
-        disp_help
+        flock -w "$LOCK_TIMEOUT" "$1"
+    fi
+}
+
+if [[ "$ENABLE_ROOT_CHECK" == true && "$(id -u)" != 0 ]]; then
+    fail 'Root privileges are required'
+fi
+if [[ "$ENABLE_LOCKING" == true ]]; then
+    exec {LOCK_FD}>"$LOCK_FILE" || fail "Cannot open lock ${LOCK_FILE}"
+    wait_for_lock "$LOCK_FD" || fail 'Timed out waiting for tape lock'
+fi
+tar_version=$("$TAR_COMMAND" --version) || fail 'Cannot run tar'
+[[ "$tar_version" == *'GNU tar'* ]] || fail 'GNU tar is required (set TAR_COMMAND if necessary)'
+
+if [[ "$MODE" == list ]]; then
+    logger INFO "Listing archive on ${TAPE_DEVICE}"
+    # Preserve tar's status and all output, including multi-volume prompts.
+    "$TAR_COMMAND" --list --verbose --multi-volume --file="$TAPE_DEVICE"
+    exit $?
 fi
 
+command -v python3 >/dev/null || fail 'Python 3 is required for JSON metadata'
+command -v flock >/dev/null || fail 'flock is required for snapshot locking'
+logger INFO "=== TAPE BACKUP RUN — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+logger DEBUG "Host: $(hostname); OS: $(uname -s) $(uname -r); user: $(id -un)"
+logger DEBUG "Source: ${NFS_SOURCE}; mount: ${MOUNT_POINT}; tape: ${TAPE_DEVICE}"
+logger INFO "Log file: ${LOG_FILE}"
 
-# Options
-optspec="hv:-:"
-while getopts "${optspec}" opt
-    do
-        case "${opt}" in
-            -)
-                case "${OPTARG}" in
-                    xxxx)
-                        opt_xxxx="${!OPTIND}"
-                        (( OPTIND++ ))
-                    ;;
-                    xxxx=*)
-                        opt_xxxx=${OPTARG#*=}
-                    ;;
-                    verbose)
-                        debug_level="${!OPTIND}"
-                        (( OPTIND++ ))
-                        logger DEBUG "debug_level set to '${debug_level}'"
-                    ;;
-                    verbose=*)
-                        debug_level=${OPTARG#*=}
-                        logger DEBUG "debug_level set to '${debug_level}'"
-                    ;;
-                    v|vv|vvv|vvvv)
-                        case "${OPTARG}" in
-                            v)
-                                debug_level=1
-                            ;;
-                            vv)
-                                debug_level=2
-                            ;;
-                            vvv)
-                                debug_level=3
-                            ;;
-                            vvvv)
-                                debug_level=4
-                            ;;
-                        esac
-                        logger DEBUG "debug_level set to '${debug_level}'"
-                    ;;
-                    *)
-                        if [ "$OPTERR" = 1 ] && [ "${optspec:0:1}" != ":" ]; then
-                            echo "Unknown option --${OPTARG}" >&2
-                        fi
-                    ;;
-                esac
-            ;;
-            v)
-                case ${OPTARG} in
-                    "0")
-                        debug_level=0
-                    ;;
-                    "1")
-                        debug_level=1
-                    ;;
-                    "2")
-                        debug_level=2
-                    ;;
-                    "3")
-                        debug_level=3
-                    ;;
-                    "4")
-                        debug_level=4
-                    ;;
-                    v*)
-                        case "${OPTARG}" in
-                            v)
-                                debug_level=2
-                            ;;
-                            vv)
-                                debug_level=3
-                            ;;
-                            vvv)
-                                debug_level=4
-                            ;;
-                            *)
-                                >&2 echo "invalid debug level specified: 'v$(OPTARG)'"
-                                disp_help 1
-                            ;;
-                        esac
-                        logger DEBUG "debug_level set to '${debug_level}'"
-                    ;;
-                    *)
-                        >&2 echo "invalid debug level specified: '$(OPTARG)'"
-                        disp_help 1
-                    ;;
-                esac
-                logger DEBUG "debug_level set to '${debug_level}'"
-            ;;
-            h)
-                disp_help 0
-            ;;
-        esac
-    done
-shift $((OPTIND-1))
-
-# Arguments
-if [ $# -gt 0 ]
-    then
-        logger DEBUG "Parsing arguments"
-        #Set argument variables here, like arg_file=$1
+# Validate persistent paths before mounting or touching tape. Recheck after mount
+# as well, since the mount can change symlink resolution.
+python3 "${SCRIPT_DIR}/tape_metadata.py" validate \
+    --source "$MOUNT_POINT" --db-dir "$BACKUP_DB_DIR" --catalog "$METADATA_FILE" \
+    || fail 'Invalid metadata storage paths'
+mkdir -p "$MOUNT_POINT" || fail 'Cannot create mount point'
+if mountpoint -q "$MOUNT_POINT"; then
+    fail "${MOUNT_POINT} is already mounted; refusing to back up an unverified source"
 fi
-
-#####################
-## SCRIPT STARTS HERE  
-#####################
-
-logger DEBUG "Scanning for SCSI devices..."
-lsscsi || logger WARNING "lsscsi failed"
-
-TAPE="${TAPE_DEVICE:?TAPE_DEVICE not set in .env}"
-SRC="${NFS_SOURCE:-/nfs/src}"
-DIR="${MOUNT_POINT:?MOUNT_POINT not set in .env}"
-BACKUP_DB_DIR="${BACKUP_DB_DIR:-/root/backup_db}"
-
-logger DEBUG "Mounting NFS share ${SRC} to ${DIR}..."
-if ! mount "$SRC" "$DIR"; then
-    logger ERROR "Failed to mount ${SRC} on ${DIR}"
-    exit 1
-fi
-
-# Validate the mount is actually usable (mount(1) can succeed even if the
-# filesystem is stale or unreachable)
-if [[ ! -d "${DIR}" || ! $(mountpoint -q "${DIR}" 2>/dev/null || true) ]]; then
-    logger ERROR "NFS mount at ${DIR} is not accessible"
-    exit 1
-fi
-
-logger INFO "NFS share ${SRC} mounted successfully on ${DIR}"
-
+mount "$NFS_SOURCE" "$MOUNT_POINT" || fail "Cannot mount ${NFS_SOURCE}"
 MOUNTED_NFS=true
+mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT" && -r "$MOUNT_POINT" ]] \
+    || fail "NFS mount at ${MOUNT_POINT} is not accessible"
+python3 "${SCRIPT_DIR}/tape_metadata.py" validate \
+    --source "$MOUNT_POINT" --db-dir "$BACKUP_DB_DIR" --catalog "$METADATA_FILE" \
+    || fail 'Invalid metadata storage paths after mount'
 
-mkdir -p "$BACKUP_DB_DIR" || {
-    logger ERROR "Failed to create backup directory ${BACKUP_DB_DIR}"
-    exit 1
-}
-
-DIRNAME=$(basename "$DIR")
+mkdir -p "$BACKUP_DB_DIR" "$(dirname "$METADATA_FILE")" || fail 'Cannot create metadata storage'
+DIRNAME=$(basename "$MOUNT_POINT")
 LISTED_INCREMENTAL="${BACKUP_DB_DIR}/${DIRNAME}.tardb"
+# Snapshot serialization is mandatory even when the optional tape lock is off.
+exec {SNAPSHOT_FD}>"${LISTED_INCREMENTAL}.lock" || fail 'Cannot open snapshot lock'
+wait_for_lock "$SNAPSHOT_FD" || fail 'Timed out waiting for snapshot lock'
+WORK_DIR=$(mktemp -d "${BACKUP_DB_DIR}/.tapebackup.XXXXXXXX") || fail 'Cannot create working directory'
+BACKUP_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+MANIFEST_MEMBER=".tapebackup/backup_manifest_${BACKUP_ID}.json"
+INVENTORY_MEMBER=".tapebackup/files_${BACKUP_ID}.jsonl"
 
-logger DEBUG "Starting incremental backup of ${DIR} to ${TAPE}..."
-if ! tar -clpMvf "$TAPE" -g "$LISTED_INCREMENTAL" "$DIR"; then
-    logger ERROR "Backup failed"
-    exit 1
-fi
+python3 "${SCRIPT_DIR}/tape_metadata.py" prepare \
+    --source "$MOUNT_POINT" --db-dir "$BACKUP_DB_DIR" --catalog "$METADATA_FILE" \
+    --snapshot "$LISTED_INCREMENTAL" --work-dir "$WORK_DIR" \
+    --backup-id "$BACKUP_ID" --start-epoch "$START_EPOCH" \
+    --nfs-source "$NFS_SOURCE" --tape-device "$TAPE_DEVICE" --full "$FULL_BACKUP" \
+    || fail 'Cannot prepare manifest and snapshot history'
 
-logger INFO "Rewinding tape device..."
-mt rewind || {
-    logger WARNING "Failed to rewind tape"
-}
+printf '%s\n' "$MANIFEST_MEMBER" "$INVENTORY_MEMBER" > "${WORK_DIR}/.tapebackup/manifests_included"
+printf '1\n' > "${WORK_DIR}/volume-number"
+logger INFO "Writing backup ${BACKUP_ID}; use this ID to identify its tapes"
+# GNU tar labels every volume with BACKUP_ID and its volume number. A separate
+# label-writing pass on an auto-rewinding device could overwrite the backup.
+# The JSON manifest is the first regular member, before inventory and source.
+# Incremental mode allows one -C and sorts operands. Relative .tapebackup names
+# sort before the absolute source; tar safely strips its leading / on output.
+"$TAR_COMMAND" --create --one-file-system --preserve-permissions --multi-volume \
+    --verbose --file="$TAPE_DEVICE" --label="$BACKUP_ID" \
+    --volno-file="${WORK_DIR}/volume-number" \
+    --listed-incremental="${WORK_DIR}/snapshot.tardb" \
+    --anchored --no-wildcards --exclude="${MOUNT_POINT}/.tapebackup" \
+    --transform='flags=r;s|^\.tapebackup/manifests_included$|.manifests_included|' \
+    -C "$WORK_DIR" "$MANIFEST_MEMBER" "$INVENTORY_MEMBER" \
+    .tapebackup/manifests_included "$MOUNT_POINT" \
+    || fail 'Backup failed; last successful snapshot has not been advanced'
 
-logger INFO "Ejecting tape device..."
-mt -f "$TAPE" eject || {
-    logger WARNING "Failed to eject tape"
-}
+python3 "${SCRIPT_DIR}/tape_metadata.py" complete --work-dir "$WORK_DIR" \
+    || fail "Tape written but metadata commit failed for ${BACKUP_ID}; snapshot not advanced"
 
-logger INFO "Backup completed successfully"
-
-# Compute and log elapsed time
-END_EPOCH=$(date +%s)
-ELAPSED=$((END_EPOCH - START_EPOCH))
-if [ "$ELAPSED" -lt 60 ]; then
-    logger DEBUG "Elapsed time: ${ELAPSED}s"
+# The source copy is a convenience only. The authoritative catalog and copies
+# are outside the backup tree, and the embedded manifest needs no NAS access.
+if mkdir -p "${MOUNT_POINT}/.tapebackup" && \
+    cp "${WORK_DIR}/${MANIFEST_MEMBER}" "${WORK_DIR}/${INVENTORY_MEMBER}" "${MOUNT_POINT}/.tapebackup/" && \
+    cp "${WORK_DIR}/.tapebackup/manifests_included" "${MOUNT_POINT}/.tapebackup/.manifests_included"; then
+    logger DEBUG 'Manifest and inventory also copied to NFS'
 else
-    MINUTES=$((ELAPSED / 60))
-    SECONDS=$((ELAPSED % 60))
-    logger INFO "Elapsed time: ${MINUTES}m ${SECONDS}s"
+    logger WARNING 'Cannot copy metadata to NFS; on-tape and permanent metadata are available'
 fi
 
-# Log final summary
-df -h / "$DIR" 2>/dev/null | while IFS= read -r line; do logger DEBUG "$line"; done
-ls -al "$BACKUP_DB_DIR/" | while IFS= read -r line; do logger DEBUG "$line"; done
-logger INFO "Log file location: ${LOG_FILE}"
-logger INFO "Metadata file location: ${LOG_DIR}/tape_backup_*_meta.txt"
-
+mt -f "$TAPE_DEVICE" rewind || logger WARNING 'Failed to rewind tape'
+mt -f "$TAPE_DEVICE" eject || logger WARNING 'Failed to eject tape'
+logger INFO "Backup ${BACKUP_ID} completed successfully in $(($(date +%s) - START_EPOCH))s"
+logger INFO "Catalog: ${METADATA_FILE}"
+logger INFO "Manifest: $(dirname "$METADATA_FILE")/backup_manifest_${BACKUP_ID}.json"

@@ -51,3 +51,6 @@ debug.log
 tmp/
 temp/
 *.tmp
+
+# Python metadata helper / integration tests
+__pycache__/
