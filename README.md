@@ -1,6 +1,10 @@
 # Tape Backup Script
 
+**STATUS: WORK IN PROGRESS -- not functional, incomplete.** See [RESTORE_REQUIRES.md](RESTORE_REQUIRES.md) for known gaps and required changes.
+
 A bash script for performing incremental tape backups from an NFS-mounted source.
+
+![WIP](https://img.shields.io/badge/status-WIP-yellow?style=for-the-badge)
 
 ## Features
 
