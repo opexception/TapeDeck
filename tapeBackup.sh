@@ -39,8 +39,16 @@ YAML_SCRIPT="${YAML_SCRIPT:-/global/bin/yaml/yaml.py}"
 # Get this processes PID
 MYPID=$$
 
+# Record start time (epoch) for elapsed duration calculation
+START_EPOCH=$(date +%s)
+
 # Get a timestamp
 tstamp=$(date +%Y%m%d%H%M%S)
+
+# Logfile path (captured before environment is modified by NFS mount)
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
+LOG_FILE="${LOG_DIR}/tape_backup_$(date +%Y%m%d_%H%M%S).log"
 
 # Get the base directory of this script
 SOURCE_DIR="${BASH_SOURCE[0]}"
@@ -59,10 +67,62 @@ MOUNTED_NFS=false
 LOCK_FILE="/tmp/${0}.lck"
 LOCK_FD=""
 
+###############################################################################
+## LOGGING — writes every message to logfile (with timestamps) and stdout/stderr
+###############################################################################
+
+write_log_header() {
+    # Write full system metadata to logfile — every line has a per-line timestamp
+    logger INFO "=== TAPE BACKUP RUN — $(date '+%Y-%m-%d %H:%M:%S') ==="
+    logger DEBUG ""
+    logger DEBUG "### System Information ###"
+    logger DEBUG "Hostname:      $(hostname)"
+    logger DEBUG "OS:            $(uname -s) $(uname -r)"
+    logger DEBUG "User:          $(whoami)"
+    logger DEBUG "Kernel:        $(uname -v)"
+    logger DEBUG "Architecture:  $(uname -m)"
+    logger DEBUG "Uptime:        $(uptime)"
+    logger DEBUG ""
+    logger DEBUG "### Source Details ###"
+    logger DEBUG "NFS source:    ${NFS_SOURCE}"
+    logger DEBUG "  -> server =  $(echo "${NFS_SOURCE}" | cut -d: -f1)"
+    logger DEBUG "  -> export   = $(echo "${NFS_SOURCE}" | cut -d: -f2)"
+    logger DEBUG "Mount point:   ${MOUNT_POINT}"
+    logger DEBUG "Tape device:   ${TAPE_DEVICE}"
+    logger DEBUG "Backup DB dir: ${BACKUP_DB_DIR}"
+    logger DEBUG ""
+    logger DEBUG "### Disk Usage ###"
+    df -h / 2>/dev/null | while IFS= read -r line; do logger DEBUG "  $line"; done
+
+    logger INFO "Logging to logfile: ${LOG_FILE}"
+}
+
+logger() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts
+    ts=$(date "+%Y-%m-%d %H:%M:%S")
+    local line="[${ts}] [${level}] ${msg}"
+
+    # Always write to logfile with timestamp
+    echo "${line}" >> "${LOG_FILE}" 2>/dev/null || true
+
+    # Follow existing debugit conventions for terminal output
+    case "${level}" in
+        ERROR)   >&2 echo -e "${line}" ;;
+        WARNING)       echo -e "${line}" ;;
+        INFO|DEBUG)    echo -e "${line}" ;;
+        *)     >&2 echo -e "[${ts}] [${level}] ${msg}" ;;
+    esac
+}
+
+###############################################################################
+## SCRIPT STARTS HERE  
+
 cleanup() {
     exit_code=$?
     if [[ "$MOUNTED_NFS" == "true" && -n "${DIR:-}" ]]; then
-        debugit INFO "Cleaning up: unmounting ${DIR}..."
+        logger DEBUG "Cleaning up: unmounting ${DIR}..."
         umount "${DIR}" 2>/dev/null || true
     fi
     if [[ -n "${LOCK_FD:-}" ]]; then
@@ -276,11 +336,11 @@ disp_help()
 
 
 acquire_lock() {
-    debugit INFO "Attempting to acquire lock..."
+    logger DEBUG "Attempting to acquire lock..."
 
     local fd
     exec {fd}>"${LOCK_FILE}" || {
-        debugit ERROR "Failed to open lock file for writing"
+        logger ERROR "Failed to open lock file for writing"
         return 1
     }
 
@@ -288,14 +348,14 @@ acquire_lock() {
         local existing_pid
         existing_pid=$(head -n1 "${LOCK_FILE}" 2>/dev/null | awk '{print $2}')
         if [[ -n "$existing_pid" ]]; then
-            debugit INFO "Lock already held by PID ${existing_pid}"
+            logger DEBUG "Lock already held by PID ${existing_pid}"
         fi
         exec {fd}>&-
         return 1
     fi
 
     echo "$USER $$ $(date +%Y%m%d%H%M%S)" >&${fd} || {
-        debugit WARNING "Could not write lock metadata"
+        logger WARNING "Could not write lock metadata"
     }
 
     LOCK_FD="${fd}"
@@ -307,12 +367,12 @@ acquire_lock() {
 # Make sure user has Root privileges before allowing to continue.
 
 Check_Root() {
-    debugit INFO "Checking user permissions..."
+    logger DEBUG "Checking user permissions..."
     if (( $(id -u) != 0 )); then
-        debugit ERROR "Sorry! Only root can do that"
+        logger ERROR "Sorry! Only root can do that"
         exit 1
     fi
-    debugit INFO " OK"
+    logger DEBUG " OK"
 }
 
 if [ "${ENABLE_ROOT_CHECK:-true}" == "true" ]; then
@@ -325,22 +385,25 @@ if [ "${ENABLE_LOCKING:-true}" == "true" ]; then
     fi
 fi
 
+# Write log header with system/source metadata (captured at startup)
+write_log_header
+
 # Commands
 if [ $# -ge 1 ]
     then
-        debugit "Parsing command"
+        logger DEBUG "Parsing command"
         if [ ${1#-} = $1 ]
             then
                 commandArg="$1"
                 shift
-                debugit "Command specified is: ${commandArg}"
+                logger DEBUG "Command specified is: ${commandArg}"
 
                 case ${commandArg} in
                     yyyy)
-                        debugit "Recognized command: ${commandArg}"
+                        logger DEBUG "Recognized command: ${commandArg}"
                     ;;
                     *)
-                        debugit "Unknown command: ${commandArg}"
+                        logger WARNING "Unknown command: ${commandArg}"
                         echo "${0}: Unknown command: ${commandArg}" >&2
                         disp_help 1
                 esac
@@ -348,7 +411,7 @@ if [ $# -ge 1 ]
                 commandArg="NULL"
         fi
     else
-        debugit "No command specified"
+        logger INFO "No command specified (normal execution)"
         disp_help
 fi
 
@@ -370,11 +433,11 @@ while getopts "${optspec}" opt
                     verbose)
                         debug_level="${!OPTIND}"
                         (( OPTIND++ ))
-                        debugit DEBUG "debug_level set to '${debug_level}'"
+                        logger DEBUG "debug_level set to '${debug_level}'"
                     ;;
                     verbose=*)
                         debug_level=${OPTARG#*=}
-                        debugit DEBUG "debug_level set to '${debug_level}'"
+                        logger DEBUG "debug_level set to '${debug_level}'"
                     ;;
                     v|vv|vvv|vvvv)
                         case "${OPTARG}" in
@@ -391,7 +454,7 @@ while getopts "${optspec}" opt
                                 debug_level=4
                             ;;
                         esac
-                        debugit DEBUG "debug_level set to '${debug_level}'"
+                        logger DEBUG "debug_level set to '${debug_level}'"
                     ;;
                     *)
                         if [ "$OPTERR" = 1 ] && [ "${optspec:0:1}" != ":" ]; then
@@ -433,14 +496,14 @@ while getopts "${optspec}" opt
                                 disp_help 1
                             ;;
                         esac
-                        debugit DEBUG "debug_level set to '${debug_level}'"
+                        logger DEBUG "debug_level set to '${debug_level}'"
                     ;;
                     *)
                         >&2 echo "invalid debug level specified: '$(OPTARG)'"
                         disp_help 1
                     ;;
                 esac
-                debugit DEBUG "debug_level set to '${debug_level}'"
+                logger DEBUG "debug_level set to '${debug_level}'"
             ;;
             h)
                 disp_help 0
@@ -452,7 +515,7 @@ shift $((OPTIND-1))
 # Arguments
 if [ $# -gt 0 ]
     then
-        debugit "Parsing arguments"
+        logger DEBUG "Parsing arguments"
         #Set argument variables here, like arg_file=$1
 fi
 
@@ -460,55 +523,71 @@ fi
 ## SCRIPT STARTS HERE  
 #####################
 
-debugit INFO "Scanning for SCSI devices..."
-lsscsi || debugit WARNING "lsscsi failed"
+logger DEBUG "Scanning for SCSI devices..."
+lsscsi || logger WARNING "lsscsi failed"
 
 TAPE="${TAPE_DEVICE:?TAPE_DEVICE not set in .env}"
 SRC="${NFS_SOURCE:-/nfs/src}"
 DIR="${MOUNT_POINT:?MOUNT_POINT not set in .env}"
 BACKUP_DB_DIR="${BACKUP_DB_DIR:-/root/backup_db}"
 
-debugit INFO "Mounting NFS share ${SRC} to ${DIR}..."
+logger DEBUG "Mounting NFS share ${SRC} to ${DIR}..."
 if ! mount "$SRC" "$DIR"; then
-    debugit ERROR "Failed to mount ${SRC} on ${DIR}"
+    logger ERROR "Failed to mount ${SRC} on ${DIR}"
     exit 1
 fi
 
 # Validate the mount is actually usable (mount(1) can succeed even if the
 # filesystem is stale or unreachable)
 if [[ ! -d "${DIR}" || ! $(mountpoint -q "${DIR}" 2>/dev/null || true) ]]; then
-    debugit ERROR "NFS mount at ${DIR} is not accessible"
+    logger ERROR "NFS mount at ${DIR} is not accessible"
     exit 1
 fi
 
-debugit INFO "NFS share ${SRC} mounted successfully on ${DIR}"
+logger INFO "NFS share ${SRC} mounted successfully on ${DIR}"
 
 MOUNTED_NFS=true
 
 mkdir -p "$BACKUP_DB_DIR" || {
-    debugit ERROR "Failed to create backup directory ${BACKUP_DB_DIR}"
+    logger ERROR "Failed to create backup directory ${BACKUP_DB_DIR}"
     exit 1
 }
 
 DIRNAME=$(basename "$DIR")
 LISTED_INCREMENTAL="${BACKUP_DB_DIR}/${DIRNAME}.tardb"
 
-debugit INFO "Starting incremental backup of ${DIR} to ${TAPE}..."
+logger DEBUG "Starting incremental backup of ${DIR} to ${TAPE}..."
 if ! tar -clpMvf "$TAPE" -g "$LISTED_INCREMENTAL" "$DIR"; then
-    debugit ERROR "Backup failed"
+    logger ERROR "Backup failed"
     exit 1
 fi
 
-debugit INFO "Rewinding tape device..."
+logger INFO "Rewinding tape device..."
 mt rewind || {
-    debugit WARNING "Failed to rewind tape"
+    logger WARNING "Failed to rewind tape"
 }
 
-debugit INFO "Ejecting tape device..."
+logger INFO "Ejecting tape device..."
 mt -f "$TAPE" eject || {
-    debugit WARNING "Failed to eject tape"
+    logger WARNING "Failed to eject tape"
 }
 
-debugit INFO "Backup completed successfully"
-ls -al "$BACKUP_DB_DIR/"
+logger INFO "Backup completed successfully"
+
+# Compute and log elapsed time
+END_EPOCH=$(date +%s)
+ELAPSED=$((END_EPOCH - START_EPOCH))
+if [ "$ELAPSED" -lt 60 ]; then
+    logger DEBUG "Elapsed time: ${ELAPSED}s"
+else
+    MINUTES=$((ELAPSED / 60))
+    SECONDS=$((ELAPSED % 60))
+    logger INFO "Elapsed time: ${MINUTES}m ${SECONDS}s"
+fi
+
+# Log final summary
+df -h / "$DIR" 2>/dev/null | while IFS= read -r line; do logger DEBUG "$line"; done
+ls -al "$BACKUP_DB_DIR/" | while IFS= read -r line; do logger DEBUG "$line"; done
+logger INFO "Log file location: ${LOG_FILE}"
+logger INFO "Metadata file location: ${LOG_DIR}/tape_backup_*_meta.txt"
 
