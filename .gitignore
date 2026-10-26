@@ -1,0 +1,53 @@
+# =============================================================================
+# ENVIRONMENT & SECRETS
+# =============================================================================
+
+# Ignore environment files containing secrets, API keys, or passwords
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Example env file should be committed for reference (optional)
+# .env.example
+
+# =============================================================================
+# EDITOR CONFIGURATION & FILES (VS Code + Vim)
+# =============================================================================
+
+# VS Code project settings and extensions
+.vscode/
+
+# Vim backup and swap files generated during editing
+*~
+*.bak
+*.swp
+*.swo
+*.undo
+
+# =============================================================================
+# OPERATING SYSTEM & OS-SPECIFIC ARTIFACTS
+# =============================================================================
+
+# macOS metadata and hidden resource forks
+.DS_Store
+._*
+AppleDouble
+
+# Linux/Unix shell history files (if generated inside repo)
+*.history
+*.sh_history
+
+# =============================================================================
+# SCRIPT OUTPUTS & LOGS
+# =============================================================================
+
+# Generic log files created during script execution
+*.log
+debug.log
+
+# Temporary directories often used by scripts
+tmp/
+temp/
+*.tmp

@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+
+###############################################################################
+## Initialize some variables
+###############################################################################
+HOSTNAME=$(uname -n)
+
+
+# Remove the first ".", and everything after it from $HOSTNAME
+SHORT_NAME=${HOSTNAME%%.*} 
+
+ # Remove the first ".", and everything before it from $HOSTNAME
+FULL_DOMAIN=${HOSTNAME#*.}
+
+# Remove the first ".", and everything after it from $FULL_DOMAIN
+DOMAIN=${FULL_DOMAIN%%.*} 
+
+# Full path to the scrit that we'll use to retrieve YAML variables.
+YAML_SCRIPT="/global/bin/yaml/yaml.py"
+
+# Get this processes PID
+MYPID=$$
+
+# Get a timestamp
+tstamp=$(date +%Y%m%d%H%M%S)
+
+# Get the base directory of this script
+SOURCE_DIR="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE_DIR" ]; do # resolve $SOURCE until the file is no longer a symlink
+  BIN_DIR="$( cd -P "$( dirname "$SOURCE_DIR" )" >/dev/null 2>&1 && pwd )"
+  SOURCE_DIR="$(readlink "$SOURCE_DIR")"
+  [[ $SOURCE_DIR != /* ]] && SOURCE_DIR="$BIN_DIR/$SOURCE_DIR" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+BIN_DIR="$( cd -P "$( dirname "$SOURCE_DIR" )" >/dev/null 2>&1 && pwd )"
+
+
+# Lock file in the /tmp directory
+LOCK_FILE="/tmp/${0}.lck"
+# Clean up lock file on script exit
+trap "rm -f ${LOCK_FILE}" EXIT
+
+###############################################################################
+## SETUP DEBUGGING/LOGGING
+###############################################################################
+# use the "-x" argument to set debugging.
+# Initial debug level. Will be overwritten by "-x" argument, once it has been parsed.
+#debug_level=0 # Silent. No additional debug output at all
+#debug_level=1 # Write only ERRORs to stderr
+#debug_level=2 # Write ERRORs to stderr, and WARNINGs to stdout
+#debug_level=3 # Write ERRORs to stderr, WARNINGs and INFOs to stdout
+debug_level=4 # Write ERRORs to stderr, WARNINGs, INFOs, and DEBUGs to stdout
+
+debugit()
+    { # Output debug messages depending on how $debug_level is set.
+      # first argument is the type of message. Must be one of the following:
+      #    ERROR
+      #    WARNING
+      #    INFO
+      #    DEBUG
+      # Example: 
+      #   debugit INFO "This is how you use the debug feature."
+      # Example output:
+      #   INFO: This is how you use the debug feature.
+
+    case ${debug_level} in
+        0)
+            return 0
+        ;;
+        1)
+            case ${1} in
+                ERROR)
+                    shift
+                    >&2 echo -e "ERROR: $@"
+                    return 0
+                ;;
+                WARNING)
+                    return 0
+                ;;
+                INFO)
+                    return 0
+                ;;
+                DEBUG)
+                    return 0
+                ;;
+                *)
+                    >&2 echo -e "INTERNAL ERROR - Debug message type '$1' is invalid."
+                    return 1
+                ;;
+            esac
+        ;;
+        2)
+            case ${1} in
+                ERROR)
+                    shift
+                    >&2 echo -e "ERROR: $@"
+                    return 0
+                ;;
+                WARNING)
+                    shift
+                    echo -e "WARNING: $@"
+                    return 0
+                ;;
+                INFO)
+                    return 0
+                ;;
+                DEBUG)
+                    return 0
+                ;;
+                *)
+                    >&2 echo -e "INTERNAL ERROR - Debug message type '$1' is invalid."
+                    return 1
+                ;;
+            esac
+        ;;
+        3)
+            case ${1} in
+                ERROR)
+                    shift
+                    >&2 echo -e "ERROR: $@"
+                    return 0
+                ;;
+                WARNING)
+                    shift
+                    echo -e "WARNING: $@"
+                    return 0
+                ;;
+                INFO)
+                    shift
+                    echo -e "INFO: $@"
+                    return 0
+                ;;
+                DEBUG)
+                    return 0
+                ;;
+                *)
+                    >&2 echo "INTERNAL ERROR - Debug message type '$1' is invalid."
+                    return 1
+                ;;
+            esac
+        ;;
+        4)
+            case ${1} in
+                ERROR)
+                    shift
+                    >&2 echo -e "ERROR: $@"
+                    return 0
+                ;;
+                WARNING)
+                    shift
+                    echo -e "WARNING: $@"
+                    return 0
+                ;;
+                INFO)
+                    shift
+                    echo -e "INFO: $@"
+                    return 0
+                ;;
+                DEBUG)
+                    shift
+                    echo -e "DEBUG: $@"
+                    return 0
+                ;;
+                *)
+                    >&2 echo "INTERNAL ERROR - Debug message type '$1' is invalid."
+                    return 1
+                ;;
+            esac
+        ;;
+        *)
+            echo "INTERNAL ERROR - Invalid debug level '${debug_level}'"
+            echo "Setting debug level to default of 3"
+            debug_level=3
+        ;;
+    esac
+    }
+
+
+yay_nay()
+    { # A yes/no prompt
+        if (( $# > 0 ))
+            then
+                MSG="$@"
+            else
+                MSG="Would you like to continue?"
+        fi
+        read -p "${MSG} [y/N]: " yaynay
+        yaynay=$(echo ${yaynay:0:1} | tr "[a-z]" "[A-Z]")
+        case ${yaynay} in
+            Y)
+                return 0
+            ;;
+            N)
+                return 1
+            ;;
+            "")
+                return 1 # Default to No
+                #return 0 # Default to Yes
+            ;;
+            *)
+                yay_nay $@
+                return $?
+            ;;
+        esac
+    }
+
+
+disp_help()
+    { # Print script help to screen, and exit.
+      # Optional argument will set exit value.
+        echo -e "This is help."
+        echo -e "usage: $0 {COMMAND} {OPTION} {ARGUMENTS}"
+        echo -e "Commands:"
+        echo -e "\tex\t- Example command"
+        echo -e "Options:"
+        echo -e "\t--opt_one|-o\t- Example option"
+        echo -e "Argument\t- File name"
+        if [ $# = 1 ]
+            then
+                if [[ "$1" =~ '^[0-9]+$' ]]
+                    then exit $1
+                    else exit 2
+                fi
+            else
+                exit
+        fi
+    }
+
+
+function verify_lock
+    { # Used by lock_check() to validate the successful creation of a lock file while avoiding race conditions from competing processes.
+        local locked_by
+
+        # locked_by has 3 ordered elements: 0-User who locked it, 1-PID of locking process, and 2-Timestamp of the lock
+        locked_by=( $(head -1 ${LOCK_FILE}) )
+
+        if [ "${locked_by[1]}" != "${MYPID}" ]
+            then
+                if [ "${GOT_LOCK}" == "false" ]
+                    then
+                        [ $debug_level -ge 2 ] && echo -n "."
+                    else
+                        debugit WARNING "File is locked by \"${locked_by[0]}\" with process \"${locked_by[1]}\" since \"${locked_by[2]}\"."
+                        GOT_LOCK="false"
+                fi
+                return 1
+            else
+                debugit INFO "Acquired successful lock"
+                GOT_LOCK="true"
+                return 0
+        fi
+    }
+
+
+function create_lock
+    { # Create a lock file
+        debugit INFO "Attempting to lock"
+        if touch ${LOCK_FILE}
+            then
+                echo "${USER} ${MYPID} ${tstamp}" >> ${LOCK_FILE}  #Append rather than overwirite, because other process can blow away a sucessful lock in a race condition.
+            else
+                debugit ERROR "Unable to create or write lock file '${LOCK_FILE}'"
+        fi
+    }
+
+
+function lock_check
+    { # Check if we have a lock file, and if not, create one. 
+      # timeout=n can be used to wait for a lock file to become available for "n" seconds
+        debugit INFO "Checking for lock file..."
+
+        local count
+        local timeout
+        local timed_out
+        count=0
+        timeout=60
+        timed_out=""
+        while [ -f ${LOCK_FILE} ]
+            do
+                if [ $count -gt ${timeout} ]
+                    then
+                        timed_out=1
+                        break
+                fi
+
+                verify_lock
+                if [ $? == "0" ]
+                    then
+                        break
+                    else
+                        sleep 1
+                        (( count++ ))
+                        continue
+                fi
+            done
+
+        if [ "${timed_out}" != "1" ]
+            then
+                if [ "${GOT_LOCK}" != "true" ]
+                    then
+                        if [ -f ${LOCK_FILE} ]
+                            then
+                                lock_check
+                            else
+                                create_lock
+                                lock_check
+                        fi
+                    else
+                        return 0
+                fi
+            else
+                debugit ERROR "Lock file unavailable for more than ${timeout} seconds, exiting"
+                exit 2
+        fi
+    }
+
+
+# Make sure user has Root privileges before allowing to continue.
+
+Check_Root()
+   { # Check if running as root.
+        debugit INFO "Checking user permissions..."
+        if (( $(id -u) != 0 ))
+            then
+                debugit ERROR "Sorry! Only root can do that"
+        fi
+        debugit INFO " OK"
+    }
+
+# Uncomment this line if root permissions are required to run this script.
+#
+#Check_Root
+
+# Uncomment this line to enable lock file creation.
+# The remainder of this script will not run if a lock file cannot be obtained
+# By default, will wait for 60 seconds for lock file to free up, checking once every second.
+#
+#lock_check
+
+# Commands
+if [ $# -ge 1 ]
+    then
+        debugit "Parsing command"
+        if [ ${1#-} = $1 ]
+            then
+                commandArg="$1"
+                shift
+                debugit "Command specified is: ${commandArg}"
+
+                case ${commandArg} in
+                    yyyy)
+                        debugit "Recognized command: ${commandArg}"
+                    ;;
+                    *)
+                        debugit "Unknown command: ${commandArg}"
+                        echo "${0}: Unknown command: ${commandArg}" >&2
+                        disp_help 1
+                esac
+            else
+                commandArg="NULL"
+        fi
+    else
+        debugit "No command specified"
+        disp_help
+fi
+
+
+# Options
+optspec="hv:-:"
+while getopts "${optspec}" opt
+    do
+        case "${opt}" in
+            -)
+                case "${OPTARG}" in
+                    xxxx)
+                        opt_xxxx="${!OPTIND}"
+                        (( OPTIND++ ))
+                    ;;
+                    xxxx=*)
+                        opt_xxxx=${OPTARG#*=}
+                    ;;
+                    verbose)
+                        debug_level="${!OPTIND}"
+                        (( OPTIND++ ))
+                        debugit DEBUG "debug_level set to '${debug_level}'"
+                    ;;
+                    verbose=*)
+                        debug_level=${OPTARG#*=}
+                        debugit DEBUG "debug_level set to '${debug_level}'"
+                    ;;
+                    v|vv|vvv|vvvv)
+                        case "${OPTARG}" in
+                            v)
+                                debug_level=1
+                            ;;
+                            vv)
+                                debug_level=2
+                            ;;
+                            vvv)
+                                debug_level=3
+                            ;;
+                            vvvv)
+                                debug_level=4
+                            ;;
+                        esac
+                        debugit DEBUG "debug_level set to '${debug_level}'"
+                    ;;
+                    *)
+                        if [ "$OPTERR" = 1 ] && [ "${optspec:0:1}" != ":" ]; then
+                            echo "Unknown option --${OPTARG}" >&2
+                        fi
+                    ;;
+                esac
+            ;;
+            v)
+                case ${OPTARG} in
+                    "0")
+                        debug_level=0
+                    ;;
+                    "1")
+                        debug_level=1
+                    ;;
+                    "2")
+                        debug_level=2
+                    ;;
+                    "3")
+                        debug_level=3
+                    ;;
+                    "4")
+                        debug_level=4
+                    ;;
+                    v*)
+                        case "${OPTARG}" in
+                            v)
+                                debug_level=2
+                            ;;
+                            vv)
+                                debug_level=3
+                            ;;
+                            vvv)
+                                debug_level=4
+                            ;;
+                            *)
+                                >&2 echo "invalid debug level specified: 'v$(OPTARG)'"
+                                disp_help 1
+                            ;;
+                        esac
+                        debugit DEBUG "debug_level set to '${debug_level}'"
+                    ;;
+                    *)
+                        >&2 echo "invalid debug level specified: '$(OPTARG)'"
+                        disp_help 1
+                    ;;
+                esac
+                debugit DEBUG "debug_level set to '${debug_level}'"
+            ;;
+            h)
+                disp_help 0
+            ;;
+        esac
+    done
+shift $((OPTIND-1))
+
+# Arguments
+if [ $# -gt 0 ]
+    then
+        debugit "Parsing arguments"
+        #Set argument variables here, like arg_file=$1
+fi
+
+#####################
+## SCRIPT STARTS HERE
+#####################
+
+# Make sure we're root
+Check_Root
+
+# Handle Locks from other processes that may be running.
+lock_check
+
+
+lsscsi
+TAPE=/dev/st0
+SRC="10.0.4.25:/xfer"
+DIR="/nas/qnap"
+export TAPE
+#mount 10.0.4.25:/xfer /nas/qnap
+mount $SRC $DIR
+
+#if DB dir doesn't exist, make it
+mkdir /root/backup_db
+
+NOW=$(date +"%m%d%Y")
+basename $DIR
+myname=$(uname -n)
+DIRNAME=$(basename $DIR)
+LISTED_INCREMENTAL="/backup-db/$DIRNAME.tardb"
+echo $DIRNAME
+time tar -clpMvf $TAPE -g $LISTED_INCREMENTAL $DIR
+mt rewind
+mt -f /dev/st0 eject
+ls -al /backup_db/
+
