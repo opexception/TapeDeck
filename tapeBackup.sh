@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 
 ###############################################################################
+## Load environment variables from .env file
+###############################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/.env" ]; then
+    set -a
+    source "${SCRIPT_DIR}/.env"
+    set +a
+fi
+
+###############################################################################
 ## Initialize some variables
 ###############################################################################
 HOSTNAME=$(uname -n)
@@ -9,14 +19,14 @@ HOSTNAME=$(uname -n)
 # Remove the first ".", and everything after it from $HOSTNAME
 SHORT_NAME=${HOSTNAME%%.*} 
 
- # Remove the first ".", and everything before it from $HOSTNAME
+  # Remove the first ".", and everything before it from $HOSTNAME
 FULL_DOMAIN=${HOSTNAME#*.}
 
 # Remove the first ".", and everything after it from $FULL_DOMAIN
 DOMAIN=${FULL_DOMAIN%%.*} 
 
-# Full path to the scrit that we'll use to retrieve YAML variables.
-YAML_SCRIPT="/global/bin/yaml/yaml.py"
+# Full path to the script that we'll use to retrieve YAML variables.
+YAML_SCRIPT="${YAML_SCRIPT:-/global/bin/yaml/yaml.py}"
 
 # Get this processes PID
 MYPID=$$
@@ -26,7 +36,7 @@ tstamp=$(date +%Y%m%d%H%M%S)
 
 # Get the base directory of this script
 SOURCE_DIR="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE_DIR" ]; do # resolve $SOURCE until the file is no longer a symlink
+while [ -h "$SOURCE_DIR" ]; do # resolve $SOURCE_DIR until the file is no longer a symlink
   BIN_DIR="$( cd -P "$( dirname "$SOURCE_DIR" )" >/dev/null 2>&1 && pwd )"
   SOURCE_DIR="$(readlink "$SOURCE_DIR")"
   [[ $SOURCE_DIR != /* ]] && SOURCE_DIR="$BIN_DIR/$SOURCE_DIR" # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
@@ -44,11 +54,7 @@ trap "rm -f ${LOCK_FILE}" EXIT
 ###############################################################################
 # use the "-x" argument to set debugging.
 # Initial debug level. Will be overwritten by "-x" argument, once it has been parsed.
-#debug_level=0 # Silent. No additional debug output at all
-#debug_level=1 # Write only ERRORs to stderr
-#debug_level=2 # Write ERRORs to stderr, and WARNINGs to stdout
-#debug_level=3 # Write ERRORs to stderr, WARNINGs and INFOs to stdout
-debug_level=4 # Write ERRORs to stderr, WARNINGs, INFOs, and DEBUGs to stdout
+debug_level="${DEBUG_LEVEL:-3}"
 
 debugit()
     { # Output debug messages depending on how $debug_level is set.
@@ -272,7 +278,7 @@ function lock_check
         local timeout
         local timed_out
         count=0
-        timeout=60
+        timeout="${LOCK_TIMEOUT:-60}"
         timed_out=""
         while [ -f ${LOCK_FILE} ]
             do
@@ -310,7 +316,7 @@ function lock_check
             else
                 debugit ERROR "Lock file unavailable for more than ${timeout} seconds, exiting"
                 exit 2
-        fi
+            fi
     }
 
 
@@ -328,13 +334,17 @@ Check_Root()
 
 # Uncomment this line if root permissions are required to run this script.
 #
-#Check_Root
+if [ "${ENABLE_ROOT_CHECK}" == "true" ]; then
+    Check_Root
+fi
 
 # Uncomment this line to enable lock file creation.
 # The remainder of this script will not run if a lock file cannot be obtained
 # By default, will wait for 60 seconds for lock file to free up, checking once every second.
 #
-#lock_check
+if [ "${ENABLE_LOCKING}" == "true" ]; then
+    lock_check
+fi
 
 # Commands
 if [ $# -ge 1 ]
@@ -478,25 +488,29 @@ Check_Root
 lock_check
 
 
+debugit INFO "Scanning for SCSI devices..."
 lsscsi
-TAPE=/dev/st0
-SRC="10.0.4.25:/xfer"
-DIR="/nas/qnap"
-export TAPE
-#mount 10.0.4.25:/xfer /nas/qnap
+
+export TAPE="${TAPE_DEVICE}"
+SRC="${NFS_SOURCE}"
+DIR="${MOUNT_POINT}"
+BACKUP_DB_DIR="${BACKUP_DB_DIR:-/root/backup_db}"
+
+debugit INFO "Mounting NFS share ${SRC} to ${DIR}..."
 mount $SRC $DIR
 
 #if DB dir doesn't exist, make it
-mkdir /root/backup_db
+mkdir -p $BACKUP_DB_DIR
 
 NOW=$(date +"%m%d%Y")
 basename $DIR
 myname=$(uname -n)
 DIRNAME=$(basename $DIR)
-LISTED_INCREMENTAL="/backup-db/$DIRNAME.tardb"
+LISTED_INCREMENTAL="${BACKUP_DB_DIR}/${DIRNAME}.tardb"
 echo $DIRNAME
+debugit INFO "Starting incremental backup of ${DIR} to ${TAPE}..."
 time tar -clpMvf $TAPE -g $LISTED_INCREMENTAL $DIR
 mt rewind
-mt -f /dev/st0 eject
-ls -al /backup_db/
+mt -f $TAPE eject
+ls -al $BACKUP_DB_DIR/
 
